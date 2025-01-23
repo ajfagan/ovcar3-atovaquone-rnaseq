@@ -1,0 +1,1556 @@
+---
+title: "Replication code for Atovaquone-induced oxidative stress reveals therapeutic opportunities in epithelial ovarian cancer"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+```{r, include=F}
+text_size = 20
+knitr::opts_chunk$set(
+  echo=F,
+  cache=T,
+  message=F,
+  include=T,
+  warning=F,
+  fig.height = 10,
+  fig.width = 10
+)
+```
+
+
+```{r, warning=F, message=F, include=F, results='hide'}
+alpha = 0.05 # significance threshold
+library(DESeq2)
+library(dplyr)
+library(pheatmap)
+library(bslib)
+library(ggplot2)
+library(colorspace)
+library(pathfindR)
+library(org.Hs.eg.db)
+library(RColorBrewer)
+library(tidyverse)
+```
+
+
+```{r, include=F}
+getwd()
+# Read raw counts
+df <- read.csv("expression.mat", sep = "\t", row.names=1)
+# We do not analyze the untreated group in this analysis, and, hence, we remove it
+df <- df[, !startsWith(colnames(df), "N")]
+# Filter out all genes that had 0 observations in any sample
+df.gene <- df[rowSums(df) > 0, ]
+df.coding <- df.gene
+df.gene$gene <- rownames(df.gene)
+
+# Convert ENSEMBL IDs to Gene Symbols
+cts <- df.gene %>%
+  mutate(
+    symbol = (
+      AnnotationDbi::select(org.Hs.eg.db, columns = c("ENSEMBL", "SYMBOL"), keys = rownames(df.coding), keytype = "ENSEMBL") %>%
+        group_by(ENSEMBL) %>%
+        summarize(SYMBOL = SYMBOL[1]) %>%
+        data.frame(row.names = "ENSEMBL")
+    )[gene, "SYMBOL"]
+  ) %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol) %>%
+  # In the event that there are multiple ENSEMBL IDs for the same gene, sum their counts
+  summarise_at(1:36, sum) %>%
+  data.frame(row.names = 1) %>%
+  round()
+
+head(cts) 
+```
+
+
+
+```{r include=F}
+coldata <- data.frame(
+  treatment = sapply(colnames(cts), function(x) {strsplit(x, "_")[[1]][1]}),
+  time = factor(sapply(colnames(cts), function(x) {strsplit(x, "_")[[1]][2]}), levels = c(1, 8, 24, 48)),
+  batch = as.factor(sapply(colnames(cts), function(x) {
+    strsplit(x, "_")[[1]][3]
+  })),
+  replicate = as.factor(sapply(colnames(cts), function(x) {
+    strsplit(x, "_")[[1]][4]
+  }))
+)
+coldata$batchA <- coldata$batch == "A"
+
+dds <- DESeqDataSetFromMatrix(
+  countData = cts, 
+  colData = coldata,
+  design = ~ treatment*time + batchA
+)
+
+dds <- DESeq(dds, reduced = ~time + batchA, test = "LRT")
+#dds <- DESeq(dds, reduced = ~treatment + batchA, test = "LRT")
+```
+
+# Design
+
+There were a total of 36 samples:
+    
+- Treatment: 30$\mu$M, 45$\mu$M, or DMSO 
+- Time: 1, 8, 24, 48 hours 
+- Batch: A (sent for sequencing in March of 2023), B (May of 2023), or C (July 2024) 
+- Replicates: 
+    - in batch A, each treatment-time pair had a single sample, for time = 1, 8, 24 
+    - in batch B, each treatment-time pair had 2 samples, for time = 1, 8, 24 
+    - in batch C, there were only samples from 48 hours, but we collected 3 samples for each treatment 
+
+
+# Data visualization
+
+
+First, we plot the raw $\log(1 + \text{counts})$ per sample as both a boxplot, to check for the presence of extreme outliers.
+The axis labels are <Treatment>_<Time>_<batch> where 
+
+- D indicates DMSO
+- IC50 indicates 30 $\mu$M
+- IC75 indicates 45 $\mu$M
+- Time is in hours
+
+
+
+```{r}
+as.data.frame(log(1 + as.matrix(assay(dds)))) %>%
+  pivot_longer(1:ncol(as.matrix(assay(dds)))) %>%
+  ggplot(aes(x = name, y = value)) +
+    geom_boxplot() + 
+    labs(
+      x = "Sample",
+      y = "log-counts"
+    ) + 
+  theme(
+    axis.text.x = element_text(angle=90)
+  )
+```
+
+
+From the boxplot, we note that all instances where fewer than 25% of genes had 0 counts occurred in either batch B replicate 2 (B-2) or C. However, this does not seem that alarming.
+
+
+Next, we plot a hierarchical clustering of the data according to the normalized estimated number of counts.
+The plot shows that batches A, B, and C have huge differences between them, which cause the batch effect to be much more prevalent than either the treatment or time effect.
+In particular, batch A seems much further than the others, while batch C seems fairly close to A.
+Batch C contains only samples after 48 hours, so differences between it and B are unsurprising.
+What is surprising is the difference between A and B, which should be more like eachother than they are to C.
+
+```{r hierarchical-clustering, echo=FALSE, warning=FALSE, message=FALSE}
+ntd <- normTransform(dds)
+sampleDists <- dist(t(assay(ntd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(ntd$group, ntd$time, ntd$treatment, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+```
+
+
+A PCA plot supports this notion. 
+This one seems to suggest that the vast majority of variance in the data can be attributed to variation between batch A, and the others. 
+After that, the next largest contributor to variance seems to be differentiating between batches B and C, and, finally, between B-1 and B-2.
+Curiously, the between-replicate variance seems rather small in C compared to B.
+
+```{r pca-plot, echo=FALSE, warning=FALSE, message=FALSE}
+plotPCA(ntd, intgroup = c("batch"), pcsToUse = 1:2)+
+  labs(color = "Batch")
+```
+
+
+
+# DE Analysis
+
+
+After normalizing, we model our data as a linear model with an interaction between time and treatment, which includes a batch effect for batch A to account for varying levels of gene $g$ in DMSO after 1 hour in the batch A group compared to the rest.
+
+\[
+  \log_2y_{gitjk} = \mu_g + {\rm Treatment}_{gi} + {\rm Time}_{gt} + {\rm TreatmentTime}_{git} + {\rm BatchA}_{gj} + \varepsilon_{gitjk},
+\]
+
+where 
+
+- $g$ = gene
+- $i$ = treatment (DMSO, 30 $\mu$M, 45 $\mu$M)
+- $t$ = time (1, 8, 24, 48 hours)
+- $j$ = batch (A, B, C --- where A,B,C contain time points 1, 8, and 24, and batch d contains only 48 hours)
+- $k$ = replicate (1 replicate per batch in A, 2 in B, and 3 replicates in batch C)
+
+
+The null model is set as
+
+\[
+  \log_2y_{gitjk} = \mu_g + {\rm Time}_{gt} + {\rm BatchA}_{gj} + \varepsilon_{gitjk},
+\]
+
+which still contains the batch adjustment, but now asserts that there is no treatment effect on the log-counts.
+
+## DE testing
+
+For each gene, we conduct a LRT to compare the full model to the reduced, null model, and, from that obtain a $p$-value. 
+Those $p$-values are then adjusted using the Benjamini-Hochberg correction, to obtain False Discovery Rate (FDR)-adjusted $p$-values.
+FDR-adjusted $p$-value cutoff for significance is set at 0.05.
+
+We also extract from that model the MLE of the $\log_2$-fold change between DMSO and IC75 Atovaquone, each at 48 hours, to model the effect size of the treatment.
+The genes with the lowest FDR are reported here.
+
+```{r}
+res <- as.data.frame(results(dds, contrast = c(
+  0, # Intercept
+  0, # 30 vs D
+  1, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  1 # 45 and 48 hrs
+)))
+
+resOrdered <- res[complete.cases(res),]
+resOrdered  <- resOrdered[order(resOrdered$pvalue),]
+resOrdered <- resOrdered[resOrdered$padj < alpha,]
+
+res %>% 
+  arrange(padj) %>%
+  dplyr::select(log2FoldChange, pvalue, padj) %>%
+  head(10) %>%
+  mutate_if(is.numeric, ~ as.character(signif(., 3))) %>%
+  knitr::kable()
+```
+
+
+
+To further investigate these genes, a heatmap showing the residuals under the null model, that the values are dependent only on time and batch, is displayed.
+Each row is a gene (marked on the right), and each column is a sample.
+Higher residuals (more red) imply that the genes in that sample are more highly expressed than would be expected under the null. 
+
+Looking at the one-hour columns, we see that there is often little variation between the three treatments.
+However, some genes, such as DDIT3 in the presence of IC75 atovaquone, do seem to be expressed differently than in DMSO after only one hour.
+Changes start becoming more clear starting with 8 hours in the high concentration samples and the vehicle samples. 
+The medium-concentration samples are going to tend to be closer to the center and, hence, more in-line with the null.
+
+
+
+```{r residual-heatmap, echo=FALSE, warning=FALSE, message=FALSE}
+null_df <- DESeqDataSetFromMatrix(
+  countData = cts,
+  colData = coldata,
+  design = ~ time + batchA
+)
+null_df <- DESeq(null_df, reduced = ~ batchA, test = "LRT")
+
+log2mu <- log2(1 + t(t(assays(null_df)[["mu"]]) / sizeFactors(null_df)))
+resids <- log2(1 + counts(null_df, normalized = TRUE)) - log2mu
+
+nselect <- 20
+select <- rownames(resOrdered)[1:nselect]
+resids <- resids[select,]
+
+ord <- order(coldata$treatment, as.numeric(coldata$time), coldata$batchA)
+resids <- resids[,ord]
+df <- coldata[ord,] %>% dplyr::select(-c(batch, batchA))
+rownames(df) <- colnames(resids)
+
+rownames(resids) <- paste(1:nselect, '. ', rownames(resids), sep = "")
+
+pheatmap(resids, cluster_rows=FALSE, show_rownames=TRUE, show_colnames = FALSE,
+         cluster_cols=FALSE, annotation_col=df)
+```
+
+```{r de-over-time}
+# 75 v DMSO @ 48
+de.time <- data.frame(
+  fc45.D.48 = results(dds, contrast = c(
+  0, # Intercept
+  0, # 30 vs D
+  1, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  1 # 45 and 48 hrs
+))$log2FoldChange
+)
+
+# 30 v DMSO @ 48
+de.time$fc30.D.48 <- results(dds, contrast = c(
+  0, # Intercept
+  1, # 30 vs D
+  0, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  1, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+))$log2FoldChange
+
+# 45 v DMSO @ 24
+de.time$fc45.D.24 <- results(dds, contrast = c(
+  0, # Intercept
+  0, # 30 vs D
+  1, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  1, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+))$log2FoldChange
+
+# 30 v DMSO @ 24
+de.time$fc30.D.24 <- results(dds, contrast = c(
+  0, # Intercept
+  1, # 30 vs D
+  0, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  1, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+))$log2FoldChange
+
+# 45 v DMSO @ 8
+de.time$fc45.D.8 <- results(dds, contrast = c(
+  0, # Intercept
+  0, # 30 vs D
+  1, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  1, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+))$log2FoldChange
+
+# 30 v DMSO @ 8
+de.time$fc30.D.8 <- results(dds, contrast = c(
+  0, # Intercept
+  1, # 30 vs D
+  0, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  1, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+))$log2FoldChange
+
+# 45 v DMSO @ 1
+de.time$fc45.D.1 <- results(dds, contrast = c(
+  0, # Intercept
+  0, # 30 vs D
+  1, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+))$log2FoldChange
+
+# 30 v DMSO @ 1
+de.time$fc30.D.1 <- results(dds, contrast = c(
+  0, # Intercept
+  1, # 30 vs D
+  0, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+))$log2FoldChange
+
+rownames(de.time) <- rownames(results(dds))
+de.time <- de.time[complete.cases(de.time),]
+
+gene_ord_all <- list(
+  "p" = rownames(results(dds)[order(res$padj, decreasing = F),]),
+  "up" = rownames(results(dds)[order(res$log2FoldChange, decreasing = T),]),
+  "down" = rownames(results(dds)[order(res$log2FoldChange, decreasing = F),]),
+  'any' = rownames(results(dds)[order(abs(res$log2FoldChange), decreasing = T),])
+)
+gene_ord <- sapply(gene_ord_all, function(x) {
+  x <- x[!is.na(results(dds)[x,"padj"]) & (results(dds)[x,"padj"] < 0.05)]
+}, USE.NAMES = T, simplify = F)
+gene_ord[['p']] <- gene_ord_all[['p']]
+
+de.time <- de.time[complete.cases(de.time),]
+
+de.time <- 
+  de.time %>%
+  tibble::rownames_to_column(var = "Gene") %>%
+  tidyr::pivot_longer(cols = 2:9) %>%
+  mutate(treatment = as.numeric(substr(name, 3, 4))) %>%
+  mutate(time = as.numeric(substr(name, 8, 9))) %>%
+  dplyr::select(-name) %>%
+  dplyr::rename(log2FoldChange = value) %>%
+  mutate(p.adj = res[Gene,"padj"])
+```
+
+
+
+# Gene Set Exploration
+
+
+## pathfindR
+
+
+PathfindR is a gene set analysis tool that uses a PIN to compare the activity of a gene set to that of random gene sets with similar subnetwork structures within that PIN. 
+In this case, for a given gene set $S$, it compares
+
+$$
+z_S = \frac{1}{|S|}\sum_{g\in S}\Phi^{-1}(1 - p_g),
+$$
+
+where $p_g$ is the FDR-adjusted $p$-value for gene $g$. 
+It then constructs set level $p$-values as $p_S = P(z_S > z_{S'})$ where $S'$ is a randomly selected subnetwork with the same structure as $S$. 
+These $p$-values are further corrected for FDR by the Benjamini-Hochberg procedure.
+
+We use Biogrid as our PIN, and KEGG as our list of gene sets. 
+We focus on 15 researcher-selected, cancer-related gene-sets, all of which had FDR-adjusted $p$-value << 0.05.
+The bubble-plot below summarizes the results of the run for each of these sets. 
+
+
+
+```{r, fig.height=8, fig.width=16}
+text_size = 23
+kegg.df <- run_pathfindR(
+    res %>%
+        mutate(gene = rownames(.)) %>%
+        dplyr::select(gene, log2FoldChange, padj) %>%
+        mutate(padj = ifelse(is.na(padj), 1, padj)),
+    plot_enrichment_chart = F
+)
+kegg.df <- cluster_enriched_terms(kegg.df, plot_clusters_graph = F, use_description = T, method="hierarchical")
+kegg_sets <- c(
+              "Proteasome", 
+              "Spliceosome",
+              "Ribosome",
+              "Cell cycle",
+              "Oxidative phosphorylation",
+              "Glycolysis / Gluconeogenesis",
+              "Citrate cycle (TCA cycle)",
+              "Pentose phosphate pathway",
+              "Glutathione metabolism",
+              "One carbon pool by folate",
+              "Protein processing in endoplasmic reticulum",
+              "Apoptosis",
+              "Natural killer cell mediated cytotoxicity",
+              "Cytokine-cytokine receptor interaction",
+              "Chemokine signaling pathway"
+            )
+
+rearrange_clust <- Vectorize(function(x) {
+  if ( x == 5 ) return(1)
+  if ( x < 5 ) return(x+1)
+  if (x > 5) return(x)
+  
+})
+kegg.df <- kegg.df %>% filter(Term_Description %in% kegg_sets)
+kegg.df <- cluster_enriched_terms(kegg.df, plot_clusters_graph = F)
+kegg.df <- kegg.df %>%
+  mutate(Cluster = rearrange_clust(Cluster))
+                                   kegg.df
+enrichment_chart(
+  kegg.df,
+  top_terms = length(kegg_sets),
+  plot_by_cluster = T
+) + 
+  scale_color_gradient(low = "#f59f9f", high = "red") +
+  theme(
+    strip.text.y = element_text(face="bold", size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    legend.text = element_text(size=text_size),
+    legend.title = element_text(size=text_size),
+    axis.text.x = element_text(size = text_size),
+    axis.title.x = element_text(size=text_size, face="bold")
+  )
+
+
+```
+
+```{r, cache=F}
+source("expression-barplot.R" )
+```
+
+In addition to these KEGG sets, we also consider a list of researcher-constructed, cancer-related gene sets, as listed below.
+Rather than treat these as typical gene sets, testing for enrichment of DE genes, instead we treat these as simply groupings of individually interesting, cancer-associated genes, linked by prior knowledge.
+
+```{r}
+# a list of researcher-defined gene sets of interest
+genesets <- list(
+  "Oxidative Stress" = list(
+    "Redox" = c(
+      "SLC7A11", 
+      "CHAC1", 
+      "MTHFD2", 
+      "SOD2",
+      "SESN2",
+      "GDF15",
+      "GADD45A",
+      "TXNIP"
+    ),
+    "DNA Repair" = c(
+      "UNC5B",
+      "DDIT4",
+      "RBBP8",
+      "LONP1"
+    )
+  ),
+  "Cell Cycle" = list(
+    "Mitotic Checkpoint" = c(
+      "BUB1", "BUB1B", "BUB3"
+    ),
+    "DNA Replication Initiation" = c(
+      "MCM10", "MCM4"
+    )
+  ),
+  "RNA and Protein Processing" = list(
+    "Spliceosome" = c(
+      "DDX23",
+      "DDX24",
+      "DDX3X"
+    ),
+    "Proteasome" = c(
+      "PSMC2",
+      "PSMD1",
+      "PSMD12", 
+      "PSMD6",
+      "PSMB2"
+    ),
+    "Ribonucleoprotein Complex" = c(
+      "SNRPD3",
+      "SNRPD1",
+      "SNRPB2",
+      "HNRNPH2",
+      "HNRNPM",
+      "HNRNPF",
+      "HNRNPDL",
+      "HNRNPR",
+      "HNRNPU",
+      "HNRNPD",
+      "HNRNPA1"
+    ),
+    "Serine and Arginine-rich Splicing Factors" = c(
+      "SRSF3",
+      "SRSF2",
+      "SRSF11",
+      "SRSF10",
+      "SRSF1"
+    )
+  ),
+  "Glycolysis and Pentose Phosphate Pathway" = list(
+    "Glycolysis and Pentose Phosphate Pathway" = c(
+      "GPI",
+      "ALDOA",
+      "G6PD",
+      "PGLS"
+    )
+  ),
+  "Folate Cycle" = list(
+    "Folate Cycle" = c("ALDH1L2", "MTHFD2", "MTHFD1L", "SHMT2", "DHFR")
+  ),
+  "Glutathione Synthesis" = list(
+    "Glutathione Synthesis" = c(
+      "GCLC",
+      "GCLM",
+      "CTH",
+      "CBS",
+      "SLC7A11"
+    )
+  ),
+  "Protein Processing in ER - 1" = list(
+    "ER Chaperones" = c(
+      "CALR",
+      "HSPA1L",
+      'HSPA8',
+      'DNAJA1',
+      'HSP90AA1',
+      'HSP90AB1',
+      'HSP90B1',
+      'HSPH1'
+    ),
+    "Protein Processing Machinery" = c(
+      "SEC61B",
+      'STT3B',
+      'OSTC'
+    ),
+    "Protein Quality Control" = c(
+      "DAD1",
+      'UBQLN1',
+      'UBQLN2',
+      'SKP1',
+      'CUL1',
+      'TRAM1L1'
+    )
+  ),
+  "Protein Processing in ER - 2" = list(
+    'ER-associated Protein Degradation' = c(
+      'GANAB',
+      'RAD23A',
+      'SEL1L',
+      'SEL1L3',
+      'HERPUD1',
+      'SYVN1'
+    ),
+    "ER Quality Control" = c(
+      'UGGT2',
+      'DNAJC10',
+      'DNAJC1',
+      'MOGS'
+    ),
+    "Unfolded Protein Response" = c(
+      'ATF4',
+      'ATF6',
+      'ERN1',
+      'XBP1',
+      'DDIT3'
+    )
+  ),
+  'CHOP-regulated Genes' = list(
+    'CHOP-regulated Genes' = c(
+      'TRIB3',
+      'TNFRSF10B',
+      'PPP1R15A',
+      'KLHDC7B',
+      'BBC3',
+      'PMAIP1',
+      'HRK'
+    )
+  ),
+ 'Natural Killer Cell Ligands' = list(
+    'Natural Killer Cell Ligands' = c(
+      'MICB',
+      'ULBP1',
+      'ULBP2',
+      'NCR3LG1'
+    )
+  ),
+  "Immune-related Genes" = list(
+    "Chemokines" = c(
+      'CXCL8',
+      'CXCL16',
+      'CXCL10'
+    ),
+    "Death Receptors" = c(
+      'TNFRSF10A',
+      'TNFRSF10B'
+    )
+  )
+)
+
+genesets
+```
+
+
+The remainder of this document serves to enable replication of the figures presented in the paper that are related to these two groups of gene sets. 
+Some figures are shown twice --- once to demonstrate from where the $p$-value is derived, and again, without the $p$-values, for a cleaner look.
+
+### Fig 1B
+
+```{r, fig.height=12, fig.width=12}
+expression_barplot(
+  de.time, 
+  genesets[["Oxidative Stress"]], 
+  x_offset = 1.5,
+  time_color_palette = "Viridis",
+  pval_annotation = T,
+  width = 0.8
+) +
+  scale_x_continuous(limits = c(-4, 4)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)
+  )
+```
+
+```{r, fig.height=12, fig.width=12}
+expression_barplot(
+  de.time, 
+  genesets[["Oxidative Stress"]], 
+  x_offset = 2.7,
+  time_color_palette = "Viridis",
+  pval_annotation = F,
+  width = 0.8
+) +
+  scale_x_continuous(limits = c(-4, 4)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)
+  )
+```
+
+
+### Supp. Fig 1
+
+```{r upset-de-genes, fig.height = 6}
+# 75 v DMSO @ 48
+contrasts <- list(
+  h48.45vsD = c(
+    0, # Intercept
+    0, # 30 vs D
+    1, # 45 vs D
+    0, # 8 hrs vs 1 hr
+    0, # 24 hrs vs 1 hr
+    0, # 48 hrs vs 1 hr
+    0, # batch A
+    0, # 30 and 8 hrs
+    0, # 45 and 8 hrs
+    0, # 30 and 24 hrs
+    0, # 45 and 24 hrs
+    0, # 30 and 48 hrs
+    1 # 45 and 48 hrs
+  )
+)
+
+# 30 v DMSO @ 48
+contrasts$h48.30vsD <- c(
+  0, # Intercept
+  1, # 30 vs D
+  0, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  1, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+)
+
+# 45 v DMSO @ 24
+contrasts$h24.45vsD = c(
+  0, # Intercept
+  0, # 30 vs D
+  1, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  1, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+)
+
+# 30 v DMSO @ 24
+contrasts$h24.30vsD <- c(
+  0, # Intercept
+  1, # 30 vs D
+  0, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  1, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+)
+
+# 45 v DMSO @ 8
+contrasts$h8.45vsD = c(
+  0, # Intercept
+  0, # 30 vs D
+  1, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  0, # 30 and 8 hrs
+  1, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+)
+
+# 30 v DMSO @ 8
+contrasts$h8.30vsD <- c(
+  0, # Intercept
+  1, # 30 vs D
+  0, # 45 vs D
+  0, # 8 hrs vs 1 hr
+  0, # 24 hrs vs 1 hr
+  0, # 48 hrs vs 1 hr
+  0, # batch A
+  1, # 30 and 8 hrs
+  0, # 45 and 8 hrs
+  0, # 30 and 24 hrs
+  0, # 45 and 24 hrs
+  0, # 30 and 48 hrs
+  0 # 45 and 48 hrs
+)
+contrasts_all <- contrasts 
+
+
+to_plot <- 
+  lapply(contrasts_all, function(x) {
+  r1 <- results(dds, test = "Wald", contrast = x) %>% 
+    as.data.frame() %>% 
+    tibble::rownames_to_column("gene") 
+  r2 <- results(dds, test = "LRT") %>% 
+    as.data.frame() %>% 
+    tibble::rownames_to_column("gene") 
+  r1$sig <- as.numeric(!is.na(r1$padj) & (r1$padj < alpha / 6) & !is.na(r2$padj) & (r2$padj < alpha ) )
+  r1
+})%>%
+  bind_rows(.id = "comparison") %>%
+  dplyr::select(comparison, gene, sig) %>%
+  filter(sig == 1) %>%
+  mutate(time = substr(comparison, 2, 3)) %>%
+  mutate(time = ifelse(
+    substr(time, 3, 3) == '.', 
+    substr(time, 2, 2),
+    as.numeric(time)
+  )) %>%
+  mutate(treatment =
+    paste(ifelse(
+      substr(comparison, 3, 3) == '.', 
+      substr(comparison, 4, 5), 
+      substr(comparison, 5, 6)
+    ), " μM",
+    sep = ""
+  )) %>%
+  mutate(time = paste(time, " hours", sep = "")) %>%
+  mutate(group = paste(treatment, " @ ", time, sep = "")) %>%
+  group_by(gene) %>%
+  summarize(group = list(group))
+text_size = 20
+to_plot %>%
+  ggplot(aes(x = group)) +
+    geom_bar() + 
+    ggupset::scale_x_upset() +
+    theme_classic() +  
+    theme(
+      axis.title.y = element_text(margin = margin(90, 90, 5, 0), size = text_size),
+      axis.text.y = element_text(size=text_size, margin = margin(l=20, b=10)),
+      axis.title.x = element_text(size = text_size),
+      axis.text.x = element_text(size = text_size)
+    ) +
+    xlab("Set Intersection") + 
+    ylab("Intersection Size")
+```
+
+
+
+### Fig 2A
+
+
+```{r, fig.height=30, fig.width=30}
+text_size=25
+expression_barplot(
+  de.time, 
+  genesets[["RNA and Protein Processing"]], 
+  x_offset = 1,
+  time_color_palette = "Viridis",
+  pval_annotation = T,
+  width = 0.8,
+  var_width = 10,
+  p.size=10
+) +
+  scale_x_continuous(limits = c(-2.05, 0.5)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )  
+  
+```
+
+```{r, fig.height=20, fig.width=20}
+text_size=25
+expression_barplot(
+  de.time, 
+  genesets[["RNA and Protein Processing"]], 
+  x_offset = 2.7,
+  time_color_palette = "Viridis",
+  pval_annotation = F,
+  width = 0.8,
+  var_width = 10
+) +
+  scale_x_continuous(limits = c(-2.05, 0.5)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )  
+  
+```
+
+### Fig 2B
+
+
+
+```{r, fig.height=8, fig.width=16}
+text_size=23
+enrichment_chart(
+  kegg.df,
+  top_terms = length(kegg_sets),
+  plot_by_cluster = T
+) + 
+  scale_color_gradient(low = "#f59f9f", high = "red") +
+  theme(
+    strip.text.y = element_text(face="bold", size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    legend.text = element_text(size=text_size),
+    legend.title = element_text(size=text_size),
+    axis.text.x = element_text(size = text_size),
+    axis.title.x = element_text(size=text_size, face="bold")
+  )
+```
+
+
+### Supp. Fig. 2A
+
+```{r, fig.height=8, fig.width=16}
+text_size = 20
+term_gene_heatmap(kegg.df %>% arrange(Cluster), use_description = T, num_terms = nrow(kegg.df), legend_title = "Change") +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    legend.text = element_text(size=text_size),
+    legend.title = element_text(size=text_size)
+  ) +
+  ggtitle("") + 
+  labs(fill = "Change") + 
+  scale_fill_manual(values = c("red", "green"), labels = c("Down", "Up", "No Change"), na.value="white") 
+```
+
+
+### Supp. Fig 2B
+
+```{r}
+input_processed <- input_processing(
+  res %>%
+    mutate(gene = rownames(.)) %>%
+    dplyr::select(gene, log2FoldChange, padj) %>%
+    mutate(padj = ifelse(is.na(padj), 1, padj))
+)
+
+gg_list <- visualize_terms(kegg.df[10:11,], input_processed, is_KEGG_result = T)
+
+gg_list[[1]]+ 
+  scale_fill_gradient2(low = "red", mid = "gray", high = "green", lim = c(-1, 1))
+```
+
+
+### Supp. Fig 3
+
+
+```{r}
+visualize_KEGG_diagram(c("hsa00190"), input_processed = input_processed, node_cols = c(
+  "red", "gray", "green"
+))[[1]] + 
+  scale_fill_gradient2(low = "red", mid = "gray", high = "green", lim = c(-1, 1))
+```
+
+### Fig 4A
+
+
+```{r}
+text_size = 20
+expression_barplot( 
+  de.time, 
+  genesets[["Glycolysis and Pentose Phosphate Pathway"]], 
+  x_offset = 0.2,
+  time_color_palette = "Viridis",
+  pval_annotation = T,
+  width = 0.8,
+  p.size=4
+) +
+  scale_x_continuous(limits = c(-1, 1)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  ) 
+```
+
+```{r}
+text_size = 20
+expression_barplot( 
+  de.time, 
+  genesets[["Glycolysis and Pentose Phosphate Pathway"]], 
+  x_offset = 2.7,
+  time_color_palette = "Viridis",
+  pval_annotation = F,
+  width = 0.8
+) +
+  scale_x_continuous(limits = c(-1, 1)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  ) 
+```
+
+### Fig 4F
+
+
+```{r}
+text_size = 20
+expression_barplot(
+  de.time, 
+  genesets[["Folate Cycle"]], 
+  x_offset = 1,
+  time_color_palette = "Viridis",
+  pval_annotation = T,
+  width = 0.8,
+  p.size=4
+) +
+  scale_x_continuous(limits = c(-2.5, 2.5)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  ) 
+```
+
+```{r}
+text_size=20
+expression_barplot(
+  de.time, 
+  genesets[["Folate Cycle"]], 
+  x_offset = 2.7,
+  time_color_palette = "Viridis",
+  pval_annotation = F,
+  width = 0.8
+) +
+  scale_x_continuous(limits = c(-2.5, 2.5)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  ) 
+```
+
+
+### Fig 4I
+
+
+```{r}
+text_size = 20
+expression_barplot(
+  de.time, 
+  genesets[["Glutathione Synthesis"]], 
+  x_offset = 1.5,
+  time_color_palette = "Viridis",
+  pval_annotation = T,
+  width = 0.8,
+  p.size=4
+) +
+  scale_x_continuous(limits = c(-2.5, 2.5)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+text_size = 20
+expression_barplot(
+  de.time, 
+  genesets[["Glutathione Synthesis"]], 
+  x_offset = 2.7,
+  time_color_palette = "Viridis",
+  pval_annotation = F,
+  width = 0.8
+) +
+  scale_x_continuous(limits = c(-2.5, 2.5)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+```
+
+
+
+### Fig 5A,H
+
+
+```{r, fig.height=40, fig.width = 20}
+require(gridExtra)
+text_size = 30
+pER <- expression_barplot(
+  de.time, 
+  c(
+    genesets[["Protein Processing in ER - 1"]], 
+    genesets[["Protein Processing in ER - 2"]]
+  ),
+  x_offset = 1.5,
+  time_color_palette = "Viridis",
+  pval_annotation = T,
+  width = 0.8,
+  var_width = 10,
+  p.size=8
+) +
+  scale_x_continuous(limits = c(-3.5, 3.5)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+
+pChop <- expression_barplot(
+  de.time, 
+  genesets[["CHOP-regulated Genes"]], 
+  x_offset = 4,
+  time_color_palette = "Viridis",
+  pval_annotation = T,
+  width = 0.8,
+  var_width = 20,
+  p.size=8
+) +
+  scale_x_continuous(limits = c(-6, 6)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+grid.arrange(pER, pChop, heights = c(32, 7))
+```
+
+
+```{r, fig.height=40, fig.width = 20}
+require(gridExtra)
+text_size = 30
+pER <- expression_barplot(
+  de.time, 
+  c(
+    genesets[["Protein Processing in ER - 1"]], 
+    genesets[["Protein Processing in ER - 2"]]
+  ),
+  x_offset = 1.5,
+  time_color_palette = "Viridis",
+  pval_annotation = F,
+  width = 0.8,
+  var_width = 10
+) +
+  scale_x_continuous(limits = c(-3.5, 3.5)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+
+pChop <- expression_barplot(
+  de.time, 
+  genesets[["CHOP-regulated Genes"]], 
+  x_offset = 4,
+  time_color_palette = "Viridis",
+  pval_annotation = F,
+  width = 0.8,
+  var_width = 20
+) +
+  scale_x_continuous(limits = c(-6, 6)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+grid.arrange(pER, pChop, heights = c(32, 7))
+```
+
+
+### Supp. Fig 6
+
+```{r}
+gg_list[[2]] + 
+  scale_fill_gradient2(low = "red", mid = "gray", high = "green", lim = c(-1, 1))
+```
+
+
+
+
+### Fig 7A
+
+
+```{r}
+text_size = 20
+expression_barplot( 
+  de.time, 
+  genesets[["Natural Killer Cell Ligands"]], 
+  x_offset = 1.5,
+  time_color_palette = "Viridis",
+  pval_annotation = T,
+  width = 0.8,
+  p.size=6
+) +
+  scale_x_continuous(limits = c(-3, 3)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+```
+
+
+```{r}
+text_size = 20
+expression_barplot( 
+  de.time, 
+  genesets[["Natural Killer Cell Ligands"]], 
+  x_offset = 2.7,
+  time_color_palette = "Viridis",
+  pval_annotation = F,
+  width = 0.8
+) +
+  scale_x_continuous(limits = c(-3, 3)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+```
+
+### Fig 7B
+
+
+```{r}
+text_size = 20
+expression_barplot(
+  de.time, 
+  genesets[["Immune-related Genes"]], 
+  x_offset = 1.5,
+  time_color_palette = "Viridis",
+  pval_annotation = T,
+  width = 0.8,
+  p.size=6
+) +
+  scale_x_continuous(limits = c(-3, 3)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+text_size = 20
+expression_barplot(
+  de.time, 
+  genesets[["Immune-related Genes"]], 
+  x_offset = 1.5,
+  time_color_palette = "Viridis",
+  pval_annotation = F,
+  width = 0.8
+) +
+  scale_x_continuous(limits = c(-3, 3)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+```
+
+
+
+### Other
+
+
+
+```{r}
+text_size=19
+expression_barplot(
+  de.time, 
+  genesets[["Cell Cycle"]], 
+  x_offset = 0.0,
+  time_color_palette = "Viridis", 
+  pval_annotation = T,
+  width = 0.8
+) +
+  scale_x_continuous(limits = c(-2.05, 0.5)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+# expression_barplot(de.time, genesets[["Cell Cycle"]]) +
+  # scale_x_continuous(limits = c(-2.05, 0.5))
+```
+
+```{r}
+text_size=19
+expression_barplot(
+  de.time, 
+  genesets[["Cell Cycle"]], 
+  x_offset = 2.7, 
+  time_color_palette = "Viridis",
+  pval_annotation = F,
+  width = 0.8
+) +
+  scale_x_continuous(limits = c(-2.05, 0.5)) +
+  ggtitle("") + 
+  theme_bw() + 
+  theme(
+    axis.line = element_line(color = 'black'),
+    panel.grid.major = element_blank(),
+    strip.text.y = element_text(face = "bold", size=text_size),
+    strip.text.x = element_text(size = text_size),
+    axis.text.x = element_text(size=text_size),
+    axis.text.y = element_text(face = "bold", size=text_size),
+    axis.title.y = element_text(size=text_size),
+    axis.title.x = element_text(size=text_size),
+    legend.text = element_text(size = text_size),
+    legend.title = element_text(size = text_size)#,
+    #panel.grid.minor = element_blank()
+  )
+# expression_barplot(de.time, genesets[["Cell Cycle"]]) +
+  # scale_x_continuous(limits = c(-2.05, 0.5))
+```
+
+
+
+
+
+
+
+
